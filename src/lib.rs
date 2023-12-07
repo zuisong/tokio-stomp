@@ -1,19 +1,22 @@
 //! tokio-stomp - A library for asynchronous streaming of STOMP messages
 
+extern crate core;
+
 use custom_debug_derive::Debug as CustomDebug;
-use frame::Frame;
 
 pub mod client;
 mod frame;
+pub mod server;
 
 pub(crate) type Result<T> = anyhow::Result<T>;
 
 /// A representation of a STOMP frame
-#[derive(Debug)]
+#[derive(CustomDebug)]
 pub struct Message<T> {
     /// The message content
     pub content: T,
     /// Headers present in the frame which were not required by the content
+    #[debug(with = "pretty_header")]
     pub extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -25,6 +28,24 @@ fn pretty_bytes(b: &Option<Vec<u8>>, f: &mut std::fmt::Formatter) -> std::fmt::R
     }
 }
 
+fn pretty_header(
+    extra_headers: &Vec<(Vec<u8>, Vec<u8>)>,
+    f: &mut std::fmt::Formatter,
+) -> std::fmt::Result {
+    let headers = extra_headers
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}:{}",
+                String::from_utf8_lossy(name.as_slice()),
+                String::from_utf8_lossy(value.as_slice())
+            )
+        })
+        .collect::<Vec<String>>();
+
+    write!(f, "{:?}", headers)
+}
+
 /// A STOMP message sent from the server
 /// See the [Spec](https://stomp.github.io/stomp-specification-1.2.html) for more information
 #[derive(CustomDebug, Clone)]
@@ -34,13 +55,14 @@ pub enum FromServer {
         version: String,
         session: Option<String>,
         server: Option<String>,
-        heartbeat: Option<String>,
+        heartbeat: Option<(u32, u32)>,
     },
     /// Conveys messages from subscriptions to the client
     Message {
         destination: String,
         message_id: String,
         subscription: String,
+        content_type: Option<String>,
         #[debug(with = "pretty_bytes")]
         body: Option<Vec<u8>>,
     },
@@ -50,26 +72,15 @@ pub enum FromServer {
     /// Something went wrong. After sending an Error, the server will close the connection
     Error {
         message: Option<String>,
+        content_type: Option<String>,
         #[debug(with = "pretty_bytes")]
         body: Option<Vec<u8>>,
     },
 }
 
-// TODO tidy this lot up with traits?
-impl Message<FromServer> {
-    // fn to_frame<'a>(&'a self) -> Frame<'a> {
-    //     unimplemented!()
-    // }
-
-    // TODO make this undead
-    fn from_frame<'a>(frame: Frame<'a>) -> Result<Message<FromServer>> {
-        frame.to_server_msg()
-    }
-}
-
 /// A STOMP message sent by the client.
 /// See the [Spec](https://stomp.github.io/stomp-specification-1.2.html) for more information
-#[derive(Debug, Clone)]
+#[derive(CustomDebug, Clone)]
 pub enum ToServer {
     #[doc(hidden)] // The user shouldn't need to know about this one
     Connect {
@@ -83,6 +94,8 @@ pub enum ToServer {
     Send {
         destination: String,
         transaction: Option<String>,
+        content_type: Option<String>,
+        #[debug(with = "pretty_bytes")]
         body: Option<Vec<u8>>,
     },
     /// Register to listen to a given destination
@@ -122,23 +135,12 @@ pub enum AckMode {
     Client,
     ClientIndividual,
 }
-
-impl Message<ToServer> {
-    fn to_frame<'a>(&'a self) -> Frame<'a> {
-        self.content.to_frame()
-    }
-
-    #[allow(dead_code)]
-    fn from_frame<'a>(frame: Frame<'a>) -> Result<Message<ToServer>> {
-        frame.to_client_msg()
-    }
-}
-
-impl From<ToServer> for Message<ToServer> {
-    fn from(content: ToServer) -> Message<ToServer> {
-        Message {
-            content,
-            extra_headers: vec![],
-        }
-    }
-}
+//
+// impl From<ToServer> for Message<ToServer> {
+//     fn from(content: ToServer) -> Message<ToServer> {
+//         Message {
+//             content,
+//             extra_headers: vec![],
+//         }
+//     }
+// }

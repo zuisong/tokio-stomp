@@ -27,12 +27,20 @@ impl<'a> Frame<'a> {
         command: &'a [u8],
         headers: &[(&'a [u8], Option<Cow<'a, [u8]>>)],
         body: Option<&'a [u8]>,
+        extra_headers: &'a Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Frame<'a> {
-        let headers = headers
+        let mut headers: Vec<(&[u8], Cow<[u8]>)> = headers
             .iter()
             // filter out headers with None value
             .filter_map(|&(k, ref v)| v.as_ref().map(|i| (k, (&*i).clone())))
             .collect();
+        let extra_headers: Vec<(&[u8], Cow<[u8]>)> = extra_headers
+            .iter()
+            .map(|(k, v)| (k.as_slice(), Cow::Borrowed(v.as_slice())))
+            .collect();
+
+        headers.extend(extra_headers);
+
         Frame {
             command,
             headers,
@@ -118,7 +126,8 @@ fn is_empty_slice(s: &[u8]) -> Option<&[u8]> {
 
 pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
     // read stream until header end
-    many_till(take(1_usize), count(line_ending, 2))(input)?;
+    // drop result for save memory
+    many_till(take(1_usize).map(drop), count(line_ending, 2))(input)?;
 
     let (input, (command, headers)) = tuple((
         delimited(opt(complete(line_ending)), alpha1, line_ending), // command
@@ -168,15 +177,16 @@ fn expect_header<'a>(headers: &'a [(&'a [u8], Cow<'a, [u8]>)], key: &'a str) -> 
     fetch_header(headers, key).ok_or_else(|| anyhow!("Expected header '{}' missing", key))
 }
 
-impl<'a> Frame<'a> {
-    #[allow(dead_code)]
-    pub(crate) fn to_client_msg(&'a self) -> Result<Message<ToServer>> {
+impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
+    type Error = anyhow::Error;
+
+    fn try_from(frame: &'a Frame<'a>) -> std::result::Result<Self, Self::Error> {
         use self::expect_header as eh;
         use self::fetch_header as fh;
         use ToServer::*;
-        let h = &self.headers;
+        let h = &frame.headers;
         let expect_keys: &[&[u8]];
-        let content = match self.command {
+        let content = match frame.command {
             b"STOMP" | b"CONNECT" | b"stomp" | b"connect" => {
                 expect_keys = &[
                     b"accept-version",
@@ -205,11 +215,17 @@ impl<'a> Frame<'a> {
                 }
             }
             b"SEND" | b"send" => {
-                expect_keys = &[b"destination", b"transaction"];
+                expect_keys = &[
+                    b"destination",
+                    b"transaction",
+                    b"content-length",
+                    b"content-type",
+                ];
                 Send {
                     destination: eh(h, "destination")?,
                     transaction: fh(h, "transaction"),
-                    body: self.body.map(|v| v.to_vec()),
+                    content_type: fh(h, "content-type"),
+                    body: frame.body.map(|v| v.to_vec()),
                 }
             }
             b"SUBSCRIBE" | b"subscribe" => {
@@ -279,30 +295,44 @@ impl<'a> Frame<'a> {
             extra_headers,
         })
     }
+}
 
-    pub(crate) fn to_server_msg(&'a self) -> Result<Message<FromServer>> {
+impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
+    type Error = anyhow::Error;
+
+    fn try_from(frame: &'a Frame<'a>) -> std::result::Result<Self, Self::Error> {
         use self::expect_header as eh;
         use self::fetch_header as fh;
         use FromServer::{Connected, Error, Message as Msg, Receipt};
-        let h = &self.headers;
+        let h = &frame.headers;
         let expect_keys: &[&[u8]];
-        let content = match self.command {
+        let content = match frame.command {
             b"CONNECTED" | b"connected" => {
                 expect_keys = &[b"version", b"session", b"server", b"heart-beat"];
                 Connected {
                     version: eh(h, "version")?,
                     session: fh(h, "session"),
                     server: fh(h, "server"),
-                    heartbeat: fh(h, "heart-beat"),
+                    heartbeat: match fh(h, "heart-beat") {
+                        Some(hb) => Some(parse_heartbeat(&hb)?),
+                        None => None,
+                    },
                 }
             }
             b"MESSAGE" | b"message" => {
-                expect_keys = &[b"destination", b"message-id", b"subscription"];
+                expect_keys = &[
+                    b"destination",
+                    b"message-id",
+                    b"subscription",
+                    b"content-length",
+                    b"content-type",
+                ];
                 Msg {
                     destination: eh(h, "destination")?,
                     message_id: eh(h, "message-id")?,
                     subscription: eh(h, "subscription")?,
-                    body: self.body.map(|v| v.to_vec()),
+                    content_type: fh(h, "content-type"),
+                    body: frame.body.map(|v| v.to_vec()),
                 }
             }
             b"RECEIPT" | b"receipt" => {
@@ -312,10 +342,11 @@ impl<'a> Frame<'a> {
                 }
             }
             b"ERROR" | b"error" => {
-                expect_keys = &[b"message"];
+                expect_keys = &[b"message", b"content-length", b"content-type"];
                 Error {
                     message: fh(h, "message"),
-                    body: self.body.map(|v| v.to_vec()),
+                    content_type: fh(h, "content-type"),
+                    body: frame.body.map(|v| v.to_vec()),
                 }
             }
             other => bail!("Frame not recognized: {:?}", String::from_utf8_lossy(other)),
@@ -337,12 +368,16 @@ impl<'a> Frame<'a> {
     }
 }
 
-fn opt_str_to_bytes<'a>(s: &'a Option<String>) -> Option<Cow<'a, [u8]>> {
+fn opt_str_to_bytes(s: &Option<String>) -> Option<Cow<[u8]>> {
     s.as_ref().map(|v| Cow::Borrowed(v.as_bytes()))
 }
 
+fn str_to_bytes(s: &String) -> Option<Cow<[u8]>> {
+    Some(Cow::Borrowed(s.as_bytes()))
+}
+
 fn get_content_length_header(body: &[u8]) -> Vec<u8> {
-    format!("content-length:{}\n", body.len()).into()
+    format!("content-length:{}\n", body.len()).into_bytes()
 }
 
 fn parse_heartbeat(hb: &str) -> Result<(u32, u32)> {
@@ -352,12 +387,73 @@ fn parse_heartbeat(hb: &str) -> Result<(u32, u32)> {
     Ok((left.parse()?, right.parse()?))
 }
 
-impl ToServer {
-    pub(crate) fn to_frame<'a>(&'a self) -> Frame<'a> {
-        use self::opt_str_to_bytes as sb;
+impl<'a> From<&'a Message<FromServer>> for Frame<'a> {
+    fn from(value: &'a Message<FromServer>) -> Self {
+        match &value.content {
+            FromServer::Connected {
+                ref version,
+                ref session,
+                ref server,
+                ref heartbeat,
+            } => Frame::new(
+                b"CONNECTED",
+                &[
+                    (b"version", str_to_bytes(version)),
+                    (
+                        b"heart-beat",
+                        heartbeat.map(|(v1, v2)| Cow::Owned(format!("{},{}", v1, v2).into())),
+                    ),
+                    (b"session", opt_str_to_bytes(session)),
+                    (b"server", opt_str_to_bytes(server)),
+                ],
+                None,
+                &value.extra_headers,
+            ),
+            FromServer::Message {
+                ref destination,
+                ref message_id,
+                ref subscription,
+                ref body,
+                ref content_type,
+            } => Frame::new(
+                b"MESSAGE",
+                &[
+                    (b"subscription", str_to_bytes(subscription)),
+                    (b"message-id", str_to_bytes(message_id)),
+                    (b"destination", str_to_bytes(destination)),
+                    (b"content-type", opt_str_to_bytes(content_type)),
+                ],
+                body.as_ref().map(|v| v.as_ref()),
+                &value.extra_headers,
+            ),
+            FromServer::Receipt { receipt_id } => Frame::new(
+                b"RECEIPT",
+                &[(b"receipt-id", str_to_bytes(receipt_id))],
+                None,
+                &value.extra_headers,
+            ),
+            FromServer::Error {
+                ref message,
+                ref body,
+                ref content_type,
+            } => Frame::new(
+                b"ERROR",
+                &[
+                    (b"message", opt_str_to_bytes(message)),
+                    (b"content-type", opt_str_to_bytes(content_type)),
+                ],
+                body.as_ref().map(|v| v.as_ref()),
+                &value.extra_headers,
+            ),
+        }
+    }
+}
+
+impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
+    fn from(msg: &'a Message<ToServer>) -> Frame<'a> {
         use Cow::*;
         use ToServer::*;
-        match *self {
+        match &msg.content {
             Connect {
                 ref accept_version,
                 ref host,
@@ -367,20 +463,24 @@ impl ToServer {
             } => Frame::new(
                 b"CONNECT",
                 &[
-                    (b"accept-version", Some(Borrowed(accept_version.as_bytes()))),
-                    (b"host", Some(Borrowed(host.as_bytes()))),
-                    (b"login", sb(login)),
+                    (b"accept-version", str_to_bytes(accept_version)),
+                    (b"host", str_to_bytes(host)),
+                    (b"login", opt_str_to_bytes(login)),
                     (
                         b"heart-beat",
                         heartbeat.map(|(v1, v2)| Owned(format!("{},{}", v1, v2).into())),
                     ),
-                    (b"passcode", sb(passcode)),
+                    (b"passcode", opt_str_to_bytes(passcode)),
                 ],
                 None,
+                &msg.extra_headers,
             ),
-            Disconnect { ref receipt } => {
-                Frame::new(b"DISCONNECT", &[(b"receipt", sb(&receipt))], None)
-            }
+            Disconnect { ref receipt } => Frame::new(
+                b"DISCONNECT",
+                &[(b"receipt", opt_str_to_bytes(&receipt))],
+                None,
+                &msg.extra_headers,
+            ),
             Subscribe {
                 ref destination,
                 ref id,
@@ -388,8 +488,8 @@ impl ToServer {
             } => Frame::new(
                 b"SUBSCRIBE",
                 &[
-                    (b"destination", Some(Borrowed(destination.as_bytes()))),
-                    (b"id", Some(Borrowed(id.as_bytes()))),
+                    (b"destination", str_to_bytes(destination)),
+                    (b"id", str_to_bytes(id)),
                     (
                         b"ack",
                         ack.map(|ack| match ack {
@@ -400,23 +500,28 @@ impl ToServer {
                     ),
                 ],
                 None,
+                &msg.extra_headers,
             ),
             Unsubscribe { ref id } => Frame::new(
                 b"UNSUBSCRIBE",
-                &[(b"id", Some(Borrowed(id.as_bytes())))],
+                &[(b"id", str_to_bytes(id))],
                 None,
+                &msg.extra_headers,
             ),
             Send {
                 ref destination,
                 ref transaction,
                 ref body,
+                ref content_type,
             } => Frame::new(
                 b"SEND",
                 &[
-                    (b"destination", Some(Borrowed(destination.as_bytes()))),
-                    (b"id", sb(transaction)),
+                    (b"destination", str_to_bytes(destination)),
+                    (b"transaction", opt_str_to_bytes(transaction)),
+                    (b"content-type", opt_str_to_bytes(content_type)),
                 ],
                 body.as_ref().map(|v| v.as_ref()),
+                &msg.extra_headers,
             ),
             Ack {
                 ref id,
@@ -424,10 +529,11 @@ impl ToServer {
             } => Frame::new(
                 b"ACK",
                 &[
-                    (b"id", Some(Borrowed(id.as_bytes()))),
-                    (b"transaction", sb(transaction)),
+                    (b"id", str_to_bytes(id)),
+                    (b"transaction", opt_str_to_bytes(transaction)),
                 ],
                 None,
+                &msg.extra_headers,
             ),
             Nack {
                 ref id,
@@ -435,25 +541,29 @@ impl ToServer {
             } => Frame::new(
                 b"NACK",
                 &[
-                    (b"id", Some(Borrowed(id.as_bytes()))),
-                    (b"transaction", sb(transaction)),
+                    (b"id", str_to_bytes(id)),
+                    (b"transaction", opt_str_to_bytes(transaction)),
                 ],
                 None,
+                &msg.extra_headers,
             ),
             Begin { ref transaction } => Frame::new(
                 b"BEGIN",
-                &[(b"transaction", Some(Borrowed(transaction.as_bytes())))],
+                &[(b"transaction", str_to_bytes(transaction))],
                 None,
+                &msg.extra_headers,
             ),
             Commit { ref transaction } => Frame::new(
                 b"COMMIT",
-                &[(b"transaction", Some(Borrowed(transaction.as_bytes())))],
+                &[(b"transaction", str_to_bytes(transaction))],
                 None,
+                &msg.extra_headers,
             ),
             Abort { ref transaction } => Frame::new(
                 b"ABORT",
-                &[(b"transaction", Some(Borrowed(transaction.as_bytes())))],
+                &[(b"transaction", str_to_bytes(transaction))],
                 None,
+                &msg.extra_headers,
             ),
         }
     }
@@ -461,9 +571,9 @@ impl ToServer {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
     use pretty_assertions::{assert_eq, assert_matches};
+
     #[test]
     fn parse_and_serialize_connect() {
         let data = b"CONNECT
@@ -485,9 +595,9 @@ passcode:password\n\n\x00"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, None);
-        let stomp = frame.to_client_msg().unwrap();
+        let stomp: Message<ToServer> = (&frame).try_into().unwrap();
         let mut buffer = BytesMut::new();
-        stomp.to_frame().serialize(&mut buffer);
+        Frame::from(&stomp).serialize(&mut buffer);
         assert_eq!(&*buffer, &*data);
     }
 
@@ -513,7 +623,7 @@ subscription:some-id
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
-        frame.to_server_msg().unwrap();
+        let _: Message<FromServer> = (&frame).try_into().unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);
@@ -539,7 +649,7 @@ subscription:some-id"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
-        frame.to_server_msg().unwrap();
+        let _: Message<FromServer> = (&frame).try_into().unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);
@@ -562,7 +672,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some("something-like-header:1".as_bytes()));
-        frame.to_server_msg().unwrap();
+        let _: Message<FromServer> = (&frame).try_into().unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);

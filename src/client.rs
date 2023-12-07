@@ -7,7 +7,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 
 pub type ClientTransport = Framed<TcpStream, ClientCodec>;
 
-use crate::frame;
+use crate::frame::{self, Frame};
 use crate::{FromServer, Message, Result, ToServer};
 use anyhow::{anyhow, bail};
 
@@ -55,14 +55,15 @@ async fn client_handshake(
 
 /// Convenience function to build a Subscribe message
 pub fn subscribe(dest: impl Into<String>, id: impl Into<String>) -> Message<ToServer> {
-    ToServer::Subscribe {
-        destination: dest.into(),
-        id: id.into(),
-        ack: None,
+    Message {
+        content: ToServer::Subscribe {
+            destination: dest.into(),
+            id: id.into(),
+            ack: None,
+        },
+        extra_headers: vec![],
     }
-    .into()
 }
-
 pub struct ClientCodec;
 
 impl Decoder for ClientCodec {
@@ -72,7 +73,7 @@ impl Decoder for ClientCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         let (item, offset) = match frame::parse_frame(&src) {
             Ok((remain, frame)) => (
-                Message::<FromServer>::from_frame(frame),
+                Message::<FromServer>::try_from(&frame),
                 remain.as_ptr() as usize - src.as_ptr() as usize,
             ),
             Err(nom::Err::Incomplete(_)) => return Ok(None),
@@ -91,7 +92,9 @@ impl Encoder<Message<ToServer>> for ClientCodec {
         item: Message<ToServer>,
         dst: &mut BytesMut,
     ) -> std::result::Result<(), Self::Error> {
-        item.to_frame().serialize(dst);
+        let f: Frame = (&item).into();
+
+        f.serialize(dst);
         Ok(())
     }
 }

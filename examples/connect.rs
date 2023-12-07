@@ -32,28 +32,35 @@ async fn main() -> Result<(), anyhow::Error> {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        sink.send(
-            ToServer::Send {
+        sink.send(Message {
+            content: ToServer::Send {
                 destination: "rusty".into(),
                 transaction: None,
+                content_type: None,
                 body: Some(b"Hello there rustaceans!".to_vec()),
-            }
-            .into(),
-        )
+            },
+            extra_headers: vec![],
+        })
         .await?;
         println!("Message sent");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        sink.send(ToServer::Unsubscribe { id: "myid".into() }.into())
-            .await?;
+        sink.send(Message {
+            content: ToServer::Unsubscribe { id: "myid".into() },
+            extra_headers: vec![],
+        })
+        .await?;
         println!("Unsubscribe sent");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        sink.send(ToServer::Disconnect { receipt: None }.into())
-            .await?;
+        sink.send(Message {
+            content: ToServer::Disconnect { receipt: None },
+            extra_headers: vec![],
+        })
+        .await?;
         println!("Disconnect sent");
 
         Ok(())
