@@ -1,3 +1,5 @@
+mod stomp_handler;
+
 use bytes::{Buf, BytesMut};
 use futures::prelude::*;
 use futures::sink::SinkExt;
