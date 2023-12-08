@@ -1,5 +1,6 @@
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
+use log::info;
 use tokio_stomp::{client, server, FromServer, Message, ToServer};
 
 async fn client(listens: &str, sends: &str, msg: &[u8]) -> Result<(), anyhow::Error> {
@@ -9,27 +10,24 @@ async fn client(listens: &str, sends: &str, msg: &[u8]) -> Result<(), anyhow::Er
         "guest".to_string().into(),
         "guest".to_string().into(),
     )
-    .await?;
+        .await?;
+
+    let mut conn = client::stomp_connection::StompConnection::new(conn);
 
     conn.send(client::subscribe(listens, "myid")).await?;
 
     loop {
-        conn.send(Message {
-            content: ToServer::Send {
-                destination: sends.into(),
-                transaction: Some("11111".into()),
-                body: Some(msg.to_vec()),
-                content_type: None,
-            },
-            extra_headers: vec![],
-        })
-        .await?;
-        let msg = conn.next().await.transpose()?;
-        if let Some(msg) = msg {
-            println!("Client Received{msg:?}");
-        } else {
-            anyhow::bail!("Unexpected: {:?}", msg)
-        }
+        // conn.send(
+        //     Message {
+        //         content: ToServer::Send {
+        //             destination: sends.into(),
+        //             transaction: Some("11111".into()),
+        //             body: Some(msg.to_vec()),
+        //             content_type: None,
+        //         },
+        //         extra_headers: vec![],
+        //     })
+        //     .await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -39,8 +37,19 @@ async fn server() -> Result<(), anyhow::Error> {
     return Ok(());
 }
 
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    tracing_subscriber::registry()
+        .with(fmt::layer()
+            .with_thread_names(true)
+            .with_line_number(true))
+        .init();
+
+
+    info!("main");
+
     let fut1 = Box::pin(server());
     let fut2 = Box::pin(client("pong", "ping", b"PING!"));
 

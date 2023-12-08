@@ -1,4 +1,5 @@
-mod stomp_handler;
+mod stomp_client;
+pub mod stomp_connection;
 
 use bytes::{Buf, BytesMut};
 use futures::prelude::*;

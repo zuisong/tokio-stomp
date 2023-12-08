@@ -52,14 +52,14 @@ async fn process_socket(tcp: TcpStream) -> Result<()> {
     tokio::spawn(async move {
         loop {
             let msg = stream.next().await.transpose().unwrap();
-            println!("server received {msg:?}")
+            log::info!("server received {msg:?}")
         }
     });
     tokio::spawn(async move {
         loop {
             sink.send(Message {
                 content: FromServer::Message {
-                    destination: "111".to_string(),
+                    destination: format!("now: {:#?}", std::time::Instant::now()) ,
                     message_id: env!("CARGO_PKG_VERSION").to_string(),
                     subscription: "11".to_string(),
                     content_type: Some("application/json".into()),
@@ -87,7 +87,7 @@ pub async fn listen(addr: impl tokio::net::ToSocketAddrs) -> Result<()> {
 
     loop {
         let (socket, client_addr) = listener.accept().await?;
-        println!(" connected from {client_addr}");
+        log::info!(" connected from {client_addr}");
         process_socket(socket).await?;
     }
 }

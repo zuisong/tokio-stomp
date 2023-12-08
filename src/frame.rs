@@ -595,7 +595,7 @@ passcode:password\n\n\x00"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, None);
-        let stomp: Message<ToServer> = (&frame).try_into().unwrap();
+        let stomp = Message::<ToServer>::try_from(&frame).unwrap();
         let mut buffer = BytesMut::new();
         Frame::from(&stomp).serialize(&mut buffer);
         assert_eq!(&*buffer, &*data);
@@ -623,7 +623,7 @@ subscription:some-id
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
-        let _: Message<FromServer> = (&frame).try_into().unwrap();
+        Message::<FromServer>::try_from(&frame).unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);
@@ -649,7 +649,7 @@ subscription:some-id"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
-        let _: Message<FromServer> = (&frame).try_into().unwrap();
+        Message::<FromServer>::try_from(&frame).unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);
@@ -672,7 +672,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some("something-like-header:1".as_bytes()));
-        let _: Message<FromServer> = (&frame).try_into().unwrap();
+        Message::<FromServer>::try_from(&frame).unwrap();
         // TODO to_frame for FromServer
         // let roundtrip = stomp.to_frame().serialize();
         // assert_eq!(roundtrip, data);
@@ -761,6 +761,6 @@ version:1.2
         ];
         let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
         assert_eq!(fh, headers_expect);
-        frame.to_server_msg().unwrap();
+        Message::<FromServer>::try_from(&frame).unwrap();
     }
 }
