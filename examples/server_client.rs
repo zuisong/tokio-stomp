@@ -1,7 +1,7 @@
-use futures::{SinkExt, StreamExt};
-use std::time::Duration;
+use futures::SinkExt;
 use log::info;
-use tokio_stomp::{client, server, FromServer, Message, ToServer};
+use std::time::Duration;
+use tokio_stomp::{client, server};
 
 async fn client(listens: &str, sends: &str, msg: &[u8]) -> Result<(), anyhow::Error> {
     let mut conn = client::connect(
@@ -10,7 +10,7 @@ async fn client(listens: &str, sends: &str, msg: &[u8]) -> Result<(), anyhow::Er
         "guest".to_string().into(),
         "guest".to_string().into(),
     )
-        .await?;
+    .await?;
 
     let mut conn = client::stomp_connection::StompConnection::new(conn);
 
@@ -42,11 +42,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::registry()
-        .with(fmt::layer()
-            .with_thread_names(true)
-            .with_line_number(true))
+        .with(fmt::layer().with_thread_names(true).with_line_number(true))
         .init();
-
 
     info!("main");
 

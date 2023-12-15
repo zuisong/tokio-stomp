@@ -1,16 +1,16 @@
-use std::ops::ControlFlow;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail};
 use bytes::{Buf, BytesMut};
 use futures::prelude::*;
 use futures::sink::SinkExt;
-use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-pub type ServerTransport = Framed<TcpStream, ServerCodec>;
-
 use crate::frame::{self, Frame};
 use crate::{FromServer, Message, Result, ToServer};
-use anyhow::{anyhow, bail};
+
+pub type ServerTransport = Framed<TcpStream, ServerCodec>;
 
 /// Connect to a STOMP server via TCP, including the connection handshake.
 /// If successful, returns a tuple of a message stream and a sender,
@@ -59,16 +59,15 @@ async fn process_socket(tcp: TcpStream) -> Result<()> {
         loop {
             sink.send(Message {
                 content: FromServer::Message {
-                    destination: format!("now: {:#?}", std::time::Instant::now()) ,
+                    destination: format!("now: {:#?}", std::time::Instant::now()),
                     message_id: env!("CARGO_PKG_VERSION").to_string(),
                     subscription: "11".to_string(),
                     content_type: Some("application/json".into()),
                     body: None,
                 },
                 extra_headers: vec![(
-                    "server".to_string().into_bytes(),
-                    format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-                        .into_bytes(),
+                    "server".to_string(),
+                    format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
                 )],
             })
             .await

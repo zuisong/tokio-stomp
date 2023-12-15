@@ -16,8 +16,8 @@ pub struct Message<T> {
     /// The message content
     pub content: T,
     /// Headers present in the frame which were not required by the content
-    #[debug(with = "pretty_header")]
-    pub extra_headers: Vec<(Vec<u8>, Vec<u8>)>,
+    // #[debug(with = "pretty_header")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 fn pretty_bytes(b: &Option<Vec<u8>>, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -135,12 +135,3 @@ pub enum AckMode {
     Client,
     ClientIndividual,
 }
-//
-// impl From<ToServer> for Message<ToServer> {
-//     fn from(content: ToServer) -> Message<ToServer> {
-//         Message {
-//             content,
-//             extra_headers: vec![],
-//         }
-//     }
-// }

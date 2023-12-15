@@ -6,19 +6,53 @@ use nom::{
     combinator::{complete, opt},
     multi::{count, many0, many_till},
     sequence::{delimited, separated_pair, terminated, tuple},
-    IResult, Parser,
+    AsBytes, FindToken, IResult, InputTakeAtPosition, Parser,
 };
 
+use crate::{AckMode, FromServer, Message, Result, ToServer};
+use custom_debug_derive::Debug as CustomDebug;
+use futures::{FutureExt, TryFutureExt};
+use nom::branch::alt;
+use nom::bytes::complete::escaped_transform;
+use nom::character::streaming::{anychar, satisfy};
+use nom::combinator::{map_opt, value};
+use nom::error::{Error, ErrorKind, ParseError};
 use std::borrow::Cow;
 
-use crate::{AckMode, FromServer, Message, Result, ToServer};
+fn pretty_command(b: &&[u8], f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    write!(f, "{:?}", String::from_utf8_lossy(b))
+}
 
-#[derive(Debug)]
+fn pretty_headers(b: &Vec<(&[u8], Cow<[u8]>)>, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    let headers = b
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{}:{}",
+                String::from_utf8_lossy(name),
+                String::from_utf8_lossy(value)
+            )
+        })
+        .collect::<Vec<String>>();
+
+    write!(f, "{:?}", headers)
+}
+
+#[derive(CustomDebug)]
 pub(crate) struct Frame<'a> {
     command: &'a [u8],
     // TODO use ArrayVec to keep headers on the stack
     // (makes this object zero-allocation)
-    headers: Vec<(&'a [u8], Cow<'a, [u8]>)>,
+    headers: Vec<(String, String)>,
+    body: Option<&'a [u8]>,
+}
+
+#[derive(CustomDebug)]
+pub(crate) struct Frame1<'a> {
+    command: &'a str,
+    // TODO use ArrayVec to keep headers on the stack
+    // (makes this object zero-allocation)
+    headers: Vec<(&'a str, String)>,
     body: Option<&'a [u8]>,
 }
 
@@ -27,16 +61,24 @@ impl<'a> Frame<'a> {
         command: &'a [u8],
         headers: &[(&'a [u8], Option<Cow<'a, [u8]>>)],
         body: Option<&'a [u8]>,
-        extra_headers: &'a Vec<(Vec<u8>, Vec<u8>)>,
+        extra_headers: &'a Vec<(String, String)>,
     ) -> Frame<'a> {
-        let mut headers: Vec<(&[u8], Cow<[u8]>)> = headers
+        let mut headers: Vec<(String, String)> = headers
             .iter()
             // filter out headers with None value
-            .filter_map(|&(k, ref v)| v.as_ref().map(|i| (k, (&*i).clone())))
+            .filter_map(|&(k, ref v)| {
+                v.as_ref().map(|i| {
+                    (
+                        String::from_utf8_lossy(k).to_string(),
+                        String::from_utf8_lossy(i.as_bytes()).to_string(),
+                    )
+                })
+            })
             .collect();
-        let extra_headers: Vec<(&[u8], Cow<[u8]>)> = extra_headers
+
+        let extra_headers: Vec<(String, String)> = extra_headers
             .iter()
-            .map(|(k, v)| (k.as_slice(), Cow::Borrowed(v.as_slice())))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
         headers.extend(extra_headers);
@@ -82,12 +124,12 @@ impl<'a> Frame<'a> {
         }
         buffer.put_slice(self.command);
         buffer.put_u8(b'\n');
-        self.headers.iter().for_each(|&(key, ref val)| {
-            for byte in key {
+        self.headers.iter().for_each(|(key, ref val)| {
+            for byte in key.as_bytes() {
                 write_escaped(*byte, buffer);
             }
             buffer.put_u8(b':');
-            for byte in val.iter() {
+            for byte in val.as_bytes() {
                 write_escaped(*byte, buffer);
             }
             buffer.put_u8(b'\n');
@@ -105,12 +147,10 @@ impl<'a> Frame<'a> {
 
 // Nom definitions
 
-fn get_content_length(headers: &[(&[u8], Cow<[u8]>)]) -> Option<usize> {
+fn get_content_length(headers: &Vec<(String, String)>) -> Option<usize> {
     for (name, value) in headers {
-        if name == b"content-length" {
-            return std::str::from_utf8(value)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
+        if name.as_str() == "content-length" {
+            return value.parse::<usize>().ok();
         }
     }
     None
@@ -125,6 +165,7 @@ fn is_empty_slice(s: &[u8]) -> Option<&[u8]> {
 }
 
 pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
+    dbg!(&String::from_utf8_lossy(input));
     // read stream until header end
     // drop result for save memory
     many_till(take(1_usize).map(drop), count(line_ending, 2))(input)?;
@@ -154,26 +195,70 @@ pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
     ))
 }
 
-fn parse_header(input: &[u8]) -> IResult<&[u8], (&[u8], Cow<[u8]>)> {
-    complete(separated_pair(
-        is_not(":\r\n"),
-        tag(":"),
-        terminated(not_line_ending, line_ending).map(Cow::Borrowed),
-    ))
+// pub fn e<'a: 'b, 'b : 'a >(
+//     f: impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>>
+// ) -> impl Parser<&'b [u8],Vec<u8>, nom::error::Error<&'b [u8]>>
+// {
+//     escaped_transform(f, '\\',
+//                       alt((
+//                           value(b"\\".as_bytes(), tag("\\")),
+//                           value(b"\"".as_bytes(), tag("\"")),
+//                           value(b"\n".as_bytes(), tag("n")),
+//                       )))
+// }
+
+// fn parse_header(input: &[u8]) -> IResult<&[u8], (&[u8], Cow<[u8]>)> {
+//     complete(separated_pair(
+//         is_not(":\r\n"),
+//         tag(":"),
+//         terminated(not_line_ending, line_ending).map(Cow::Borrowed),
+//     ))
+//     .parse(input)
+// }
+
+fn parse_header<'a>(input: &'a [u8]) -> IResult<&[u8], (String, String)> {
+    complete(
+        separated_pair(
+            is_not(":\r\n"),
+            tag(":"),
+            terminated(not_line_ending, line_ending),
+        )
+        .map(|(k, v): (&[u8], &[u8])| {
+            let k = String::from_utf8_lossy(k);
+            let k = k.as_ref();
+            let v = String::from_utf8_lossy(v);
+            let v = v.as_ref();
+
+            let mut f = escaped_transform(
+                satisfy(|c| c != '\\'),
+                '\\',
+                alt((
+                    value("\\", tag::<&str, &str, Error<&str>>("\\")),
+                    value("\r", tag("r")),
+                    value("\n", tag("n")),
+                    value(":", tag("c")),
+                )),
+            );
+
+            (
+                f(k).map(|it| it.1).unwrap_or(String::new()),
+                f(v).map(|it| it.1).unwrap_or(String::new()),
+            )
+        }),
+    )
     .parse(input)
 }
 
-fn fetch_header<'a>(headers: &'a [(&'a [u8], Cow<'a, [u8]>)], key: &'a str) -> Option<String> {
-    let kk = key.as_bytes();
-    for &(k, ref v) in headers {
-        if &*k == kk {
-            return String::from_utf8(v.to_vec()).ok();
+fn fetch_header<'a>(headers: &Vec<(String, String)>, key: &'a str) -> Option<String> {
+    for (k, ref v) in headers {
+        if &*k == key {
+            return Some(v.clone());
         }
     }
     None
 }
 
-fn expect_header<'a>(headers: &'a [(&'a [u8], Cow<'a, [u8]>)], key: &'a str) -> Result<String> {
+fn expect_header<'a>(headers: &Vec<(String, String)>, key: &'a str) -> Result<String> {
     fetch_header(headers, key).ok_or_else(|| anyhow!("Expected header '{}' missing", key))
 }
 
@@ -282,9 +367,9 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
         };
         let extra_headers = h
             .iter()
-            .filter_map(|&(k, ref v)| {
-                if !expect_keys.contains(&k) {
-                    Some((k.to_vec(), (&*v).to_vec()))
+            .filter_map(|(k, v)| {
+                if !expect_keys.contains(&k.as_bytes()) {
+                    Some((k.clone(), v.clone()))
                 } else {
                     None
                 }
@@ -353,9 +438,9 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
         };
         let extra_headers = h
             .iter()
-            .filter_map(|&(k, ref v)| {
-                if !expect_keys.contains(&k) {
-                    Some((k.to_vec(), (&*v).to_vec()))
+            .filter_map(|(k, v)| {
+                if !expect_keys.contains(&k.as_bytes()) {
+                    Some((k.clone(), v.clone()))
                 } else {
                     None
                 }
@@ -572,6 +657,8 @@ impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FromServer;
+    use crate::Message;
     use pretty_assertions::{assert_eq, assert_matches};
 
     #[test]
@@ -592,7 +679,11 @@ passcode:password\n\n\x00"
             (b"heart-beat", b"6,7"),
             (b"passcode", b"password"),
         ];
-        let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
+        let fh: Vec<_> = frame
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, None);
         let stomp = Message::<ToServer>::try_from(&frame).unwrap();
@@ -620,7 +711,11 @@ subscription:some-id
             (b"subscription", b"some-id"),
             (b"content-length", b"50"),
         ];
-        let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
+        let fh: Vec<_> = frame
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
         Message::<FromServer>::try_from(&frame).unwrap();
@@ -646,7 +741,11 @@ subscription:some-id"
             (b"message-id", b"12345"),
             (b"subscription", b"some-id"),
         ];
-        let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
+        let fh: Vec<_> = frame
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
         Message::<FromServer>::try_from(&frame).unwrap();
@@ -669,12 +768,18 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
             (b"message-id", b"12345"),
             (b"subscription", b"some-id"),
         ];
-        let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
+        let fh: Vec<_> = frame
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some("something-like-header:1".as_bytes()));
-        Message::<FromServer>::try_from(&frame).unwrap();
-        // TODO to_frame for FromServer
-        // let roundtrip = stomp.to_frame().serialize();
+        let msg = Message::<FromServer>::try_from(&frame).unwrap();
+        let mut bytes_mut = BytesMut::with_capacity(64);
+        let roundtrip = Frame::from(&msg).serialize(&mut bytes_mut);
+
+        dbg!(&bytes_mut);
         // assert_eq!(roundtrip, data);
     }
 
@@ -710,6 +815,26 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         assert_matches!(
             parse_frame(b"\nMESSAGE\r\ndestination:datafeeds.here.co.uk\n\n".as_ref()),
             Err(nom::Err::Incomplete(_))
+        );
+
+        assert_matches!(
+            parse_frame(b"\nMESSAGE\r\nheader:da\\:tafeeds.here.co.uk\n\n\0".as_ref()),
+            Ok((b"",Frame{ headers: ref a , .. })) if a[0].1 == "da:tafeeds.here.co.uk".to_string()
+        );
+
+        assert_matches!(
+            Message::<ToServer>::try_from(
+                &parse_frame(b"\nSEND\r\ndestination:da\\ntafeedsuk\n\n\0".as_ref())
+                    .unwrap()
+                    .1
+            ),
+            Ok(Message::<ToServer> {
+                content: ToServer::Send{
+                   destination: ref a  ,
+                    ..
+                },
+                ..
+            }) if a == "da\ntafeedsuk"
         );
 
         assert_matches!(
@@ -759,8 +884,19 @@ version:1.2
             (b"session", b"ID:orbstack-45879-1702220142549-3:2"),
             (b"version", b"1.2"),
         ];
-        let fh: Vec<_> = frame.headers.iter().map(|&(k, ref v)| (k, &**v)).collect();
+        let fh: Vec<_> = frame
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
         assert_eq!(fh, headers_expect);
         Message::<FromServer>::try_from(&frame).unwrap();
+    }
+
+    #[test]
+    fn test_parser_header1() {
+        let h = parse_frame(b"MESSAGE\nsubscription:11\nmessage-id:0.4.0\ndestination:now\\c Instant {\\n    tv_sec\\c 5740,\\n    tv_nsec\\c 164006416,\\n}\ncontent-type:application/json\nserver:tokio-stomp/0.4.0\n\n\0".as_ref());
+        dbg!(&h);
+        // assert_matches!(h, Ok((b"", _)),);
     }
 }

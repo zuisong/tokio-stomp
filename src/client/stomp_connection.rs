@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use futures::{SinkExt, StreamExt};
 use futures::lock::Mutex;
+use futures::{SinkExt, StreamExt};
 
-use crate::{FromServer, Message, ToServer};
 use crate::client::ClientTransport;
+use crate::{FromServer, Message, ToServer};
 
 use super::super::Result;
 
@@ -23,13 +23,17 @@ impl StompConnection {
             subscribes: HashMap::new(),
         };
 
-
         futures::executor::block_on(async move {
             loop {
-                if let Ok(msg) = client.clone().as_ref()
-                    .lock().await
-                    .next().await
-                    .transpose() {
+                if let Ok(msg) = client
+                    .clone()
+                    .as_ref()
+                    .lock()
+                    .await
+                    .next()
+                    .await
+                    .transpose()
+                {
                     log::info!("StompConnection received {msg:?}")
                 }
             }
@@ -46,13 +50,12 @@ impl StompConnection {
         //     }
         // });
 
-
         conn
     }
 
     fn subscribe<F>(&mut self, channels: String, mut func: F) -> Result<()>
-        where
-            F: FnMut(Message<FromServer>) -> ControlFlow<()>,
+    where
+        F: FnMut(Message<FromServer>) -> ControlFlow<()>,
     {
         // self.subscribes.insert(channels,  Box::new( func));
         Ok(())
