@@ -6,17 +6,20 @@ use nom::{
     combinator::{complete, opt},
     multi::{count, many0, many_till},
     sequence::{delimited, separated_pair, terminated, tuple},
-    AsBytes, FindToken, IResult, InputTakeAtPosition, Parser,
+    AsBytes,
+    FindToken,
+    IResult,
+    InputTakeAtPosition,
+    Parser,
+    branch::alt,
+    bytes::complete::{escaped_transform, take_while_m_n},
+    combinator::{map_res, value},
+    error::{Error, ParseError}
 };
 
 use crate::{AckMode, FromServer, Message, Result, ToServer};
 use custom_debug_derive::Debug as CustomDebug;
-use futures::{FutureExt, TryFutureExt};
-use nom::branch::alt;
-use nom::bytes::complete::escaped_transform;
-use nom::character::streaming::{anychar, satisfy};
-use nom::combinator::{map_opt, value};
-use nom::error::{Error, ErrorKind, ParseError};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use std::borrow::Cow;
 
 fn pretty_command(b: &&[u8], f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -195,61 +198,34 @@ pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
     ))
 }
 
-// pub fn e<'a: 'b, 'b : 'a >(
-//     f: impl Parser<&'a [u8], &'a [u8], nom::error::Error<&'a [u8]>>
-// ) -> impl Parser<&'b [u8],Vec<u8>, nom::error::Error<&'b [u8]>>
-// {
-//     escaped_transform(f, '\\',
-//                       alt((
-//                           value(b"\\".as_bytes(), tag("\\")),
-//                           value(b"\"".as_bytes(), tag("\"")),
-//                           value(b"\n".as_bytes(), tag("n")),
-//                       )))
-// }
-
-// fn parse_header(input: &[u8]) -> IResult<&[u8], (&[u8], Cow<[u8]>)> {
-//     complete(separated_pair(
-//         is_not(":\r\n"),
-//         tag(":"),
-//         terminated(not_line_ending, line_ending).map(Cow::Borrowed),
-//     ))
-//     .parse(input)
-// }
-
-fn parse_header<'a>(input: &'a [u8]) -> IResult<&[u8], (String, String)> {
-    complete(
-        separated_pair(
-            is_not(":\r\n"),
-            tag(":"),
-            terminated(not_line_ending, line_ending),
-        )
-        .map(|(k, v): (&[u8], &[u8])| {
-            let k = String::from_utf8_lossy(k);
-            let k = k.as_ref();
-            let v = String::from_utf8_lossy(v);
-            let v = v.as_ref();
-
-            let mut f = escaped_transform(
-                satisfy(|c| c != '\\'),
-                '\\',
-                alt((
-                    value("\\", tag::<&str, &str, Error<&str>>("\\")),
-                    value("\r", tag("r")),
-                    value("\n", tag("n")),
-                    value(":", tag("c")),
-                )),
-            );
-
-            (
-                f(k).map(|it| it.1).unwrap_or(String::new()),
-                f(v).map(|it| it.1).unwrap_or(String::new()),
-            )
-        }),
-    )
+fn parse_header(input: &[u8]) -> IResult<&[u8], (String, String)> {
+    complete(separated_pair(
+        is_not(":\r\n").and_then(unescaped),
+        tag(":"),
+        terminated(not_line_ending, line_ending).and_then(unescaped),
+    ))
     .parse(input)
 }
 
-fn fetch_header<'a>(headers: &Vec<(String, String)>, key: &'a str) -> Option<String> {
+fn unescaped(input: &[u8]) -> IResult<&[u8], String> {
+    let mut f = map_res(
+        escaped_transform(
+            take_while_m_n(1, 1, |c| c != b'\\'),
+            '\\',
+            alt((
+                value(b"\\".as_slice(), tag(b"\\")),
+                value(b"\r".as_slice(), tag(b"r")),
+                value(b"\n".as_slice(), tag(b"n")),
+                value(b":".as_slice(), tag(b"c")),
+            )),
+        ),
+        |o| String::from_utf8(o),
+    );
+
+    f.parse(input)
+}
+
+fn fetch_header(headers: &Vec<(String, String)>, key: &str) -> Option<String> {
     for (k, ref v) in headers {
         if &*k == key {
             return Some(v.clone());
@@ -258,7 +234,7 @@ fn fetch_header<'a>(headers: &Vec<(String, String)>, key: &'a str) -> Option<Str
     None
 }
 
-fn expect_header<'a>(headers: &Vec<(String, String)>, key: &'a str) -> Result<String> {
+fn expect_header(headers: &Vec<(String, String)>, key: &str) -> Result<String> {
     fetch_header(headers, key).ok_or_else(|| anyhow!("Expected header '{}' missing", key))
 }
 
@@ -818,7 +794,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         );
 
         assert_matches!(
-            parse_frame(b"\nMESSAGE\r\nheader:da\\:tafeeds.here.co.uk\n\n\0".as_ref()),
+            parse_frame(b"\nMESSAGE\r\nheader:da\\ctafeeds.here.co.uk\n\n\0".as_ref()),
             Ok((b"",Frame{ headers: ref a , .. })) if a[0].1 == "da:tafeeds.here.co.uk".to_string()
         );
 
