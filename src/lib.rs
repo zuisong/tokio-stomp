@@ -16,7 +16,6 @@ pub struct Message<T> {
     /// The message content
     pub content: T,
     /// Headers present in the frame which were not required by the content
-    // #[debug(with = "pretty_header")]
     pub extra_headers: Vec<(String, String)>,
 }
 
@@ -26,24 +25,6 @@ fn pretty_bytes(b: &Option<Vec<u8>>, f: &mut std::fmt::Formatter) -> std::fmt::R
     } else {
         write!(f, "None")
     }
-}
-
-fn pretty_header(
-    extra_headers: &Vec<(Vec<u8>, Vec<u8>)>,
-    f: &mut std::fmt::Formatter,
-) -> std::fmt::Result {
-    let headers = extra_headers
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "{}:{}",
-                String::from_utf8_lossy(name.as_slice()),
-                String::from_utf8_lossy(value.as_slice())
-            )
-        })
-        .collect::<Vec<String>>();
-
-    write!(f, "{:?}", headers)
 }
 
 /// A STOMP message sent from the server

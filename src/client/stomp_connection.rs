@@ -23,7 +23,7 @@ impl StompConnection {
             subscribes: HashMap::new(),
         };
 
-        futures::executor::block_on(async move {
+        tokio::spawn(async move {
             loop {
                 if let Ok(msg) = client
                     .clone()

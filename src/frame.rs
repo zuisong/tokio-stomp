@@ -1,93 +1,44 @@
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, BytesMut};
 use nom::{
+    branch::alt,
+    bytes::complete::{escaped_transform, take_while_m_n},
     bytes::streaming::{is_not, tag, take, take_until},
     character::streaming::{alpha1, line_ending, not_line_ending},
     combinator::{complete, opt},
+    combinator::{map_res, value},
     multi::{count, many0, many_till},
     sequence::{delimited, separated_pair, terminated, tuple},
-    AsBytes,
-    FindToken,
-    IResult,
-    InputTakeAtPosition,
-    Parser,
-    branch::alt,
-    bytes::complete::{escaped_transform, take_while_m_n},
-    combinator::{map_res, value},
-    error::{Error, ParseError}
+    IResult, Parser,
 };
 
 use crate::{AckMode, FromServer, Message, Result, ToServer};
 use custom_debug_derive::Debug as CustomDebug;
-use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use std::borrow::Cow;
-
-fn pretty_command(b: &&[u8], f: &mut std::fmt::Formatter) -> std::fmt::Result {
-    write!(f, "{:?}", String::from_utf8_lossy(b))
-}
-
-fn pretty_headers(b: &Vec<(&[u8], Cow<[u8]>)>, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-    let headers = b
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "{}:{}",
-                String::from_utf8_lossy(name),
-                String::from_utf8_lossy(value)
-            )
-        })
-        .collect::<Vec<String>>();
-
-    write!(f, "{:?}", headers)
-}
 
 #[derive(CustomDebug)]
 pub(crate) struct Frame<'a> {
-    command: &'a [u8],
-    // TODO use ArrayVec to keep headers on the stack
-    // (makes this object zero-allocation)
+    command: Cow<'a, str>,
     headers: Vec<(String, String)>,
-    body: Option<&'a [u8]>,
-}
-
-#[derive(CustomDebug)]
-pub(crate) struct Frame1<'a> {
-    command: &'a str,
-    // TODO use ArrayVec to keep headers on the stack
-    // (makes this object zero-allocation)
-    headers: Vec<(&'a str, String)>,
     body: Option<&'a [u8]>,
 }
 
 impl<'a> Frame<'a> {
     pub(crate) fn new(
-        command: &'a [u8],
-        headers: &[(&'a [u8], Option<Cow<'a, [u8]>>)],
+        command: impl Into<Cow<'a, str>>,
+        headers: Vec<(&str, Option<&String>)>,
         body: Option<&'a [u8]>,
-        extra_headers: &'a Vec<(String, String)>,
+        extra_headers: &Vec<(String, String)>,
     ) -> Frame<'a> {
         let mut headers: Vec<(String, String)> = headers
             .iter()
-            // filter out headers with None value
-            .filter_map(|&(k, ref v)| {
-                v.as_ref().map(|i| {
-                    (
-                        String::from_utf8_lossy(k).to_string(),
-                        String::from_utf8_lossy(i.as_bytes()).to_string(),
-                    )
-                })
-            })
+            .filter_map(|(k, v)| v.map(|v| (k.to_string(), v.to_string())))
             .collect();
 
-        let extra_headers: Vec<(String, String)> = extra_headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        headers.extend(extra_headers);
+        headers.extend(extra_headers.clone());
 
         Frame {
-            command,
+            command: command.into(),
             headers,
             body,
         }
@@ -125,7 +76,7 @@ impl<'a> Frame<'a> {
         if buffer.remaining_mut() < requires {
             buffer.reserve(requires);
         }
-        buffer.put_slice(self.command);
+        buffer.put_slice(self.command.as_bytes());
         buffer.put_u8(b'\n');
         self.headers.iter().for_each(|(key, ref val)| {
             for byte in key.as_bytes() {
@@ -168,13 +119,17 @@ fn is_empty_slice(s: &[u8]) -> Option<&[u8]> {
 }
 
 pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
-    dbg!(&String::from_utf8_lossy(input));
+    // dbg!(&String::from_utf8_lossy(input));
     // read stream until header end
     // drop result for save memory
     many_till(take(1_usize).map(drop), count(line_ending, 2))(input)?;
 
     let (input, (command, headers)) = tuple((
-        delimited(opt(complete(line_ending)), alpha1, line_ending), // command
+        delimited(
+            opt(complete(line_ending)),
+            alpha1.map(String::from_utf8_lossy),
+            line_ending,
+        ), // command
         terminated(
             many0(parse_header), // header
             line_ending,
@@ -200,23 +155,23 @@ pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
 
 fn parse_header(input: &[u8]) -> IResult<&[u8], (String, String)> {
     complete(separated_pair(
-        is_not(":\r\n").and_then(unescaped),
+        is_not(":\r\n").and_then(unescape),
         tag(":"),
-        terminated(not_line_ending, line_ending).and_then(unescaped),
+        terminated(not_line_ending, line_ending).and_then(unescape),
     ))
     .parse(input)
 }
 
-fn unescaped(input: &[u8]) -> IResult<&[u8], String> {
+fn unescape(input: &[u8]) -> IResult<&[u8], String> {
     let mut f = map_res(
         escaped_transform(
             take_while_m_n(1, 1, |c| c != b'\\'),
             '\\',
             alt((
-                value(b"\\".as_slice(), tag(b"\\")),
-                value(b"\r".as_slice(), tag(b"r")),
-                value(b"\n".as_slice(), tag(b"n")),
-                value(b":".as_slice(), tag(b"c")),
+                value("\\".as_bytes(), tag("\\")),
+                value("\r".as_bytes(), tag("r")),
+                value("\n".as_bytes(), tag("n")),
+                value(":".as_bytes(), tag("c")),
             )),
         ),
         |o| String::from_utf8(o),
@@ -246,16 +201,10 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
         use self::fetch_header as fh;
         use ToServer::*;
         let h = &frame.headers;
-        let expect_keys: &[&[u8]];
-        let content = match frame.command {
-            b"STOMP" | b"CONNECT" | b"stomp" | b"connect" => {
-                expect_keys = &[
-                    b"accept-version",
-                    b"host",
-                    b"login",
-                    b"passcode",
-                    b"heart-beat",
-                ];
+        let expect_keys: &[&str];
+        let content = match frame.command.as_ref() {
+            "STOMP" | "CONNECT" | "stomp" | "connect" => {
+                expect_keys = &["accept-version", "host", "login", "passcode", "heart-beat"];
                 let heartbeat = if let Some(hb) = fh(h, "heart-beat") {
                     Some(parse_heartbeat(&hb)?)
                 } else {
@@ -269,18 +218,18 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
                     heartbeat,
                 }
             }
-            b"DISCONNECT" | b"disconnect" => {
-                expect_keys = &[b"receipt"];
+            "DISCONNECT" | "disconnect" => {
+                expect_keys = &["receipt"];
                 Disconnect {
                     receipt: fh(h, "receipt"),
                 }
             }
-            b"SEND" | b"send" => {
+            "SEND" | "send" => {
                 expect_keys = &[
-                    b"destination",
-                    b"transaction",
-                    b"content-length",
-                    b"content-type",
+                    "destination",
+                    "transaction",
+                    "content-length",
+                    "content-type",
                 ];
                 Send {
                     destination: eh(h, "destination")?,
@@ -289,8 +238,8 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
                     body: frame.body.map(|v| v.to_vec()),
                 }
             }
-            b"SUBSCRIBE" | b"subscribe" => {
-                expect_keys = &[b"destination", b"id", b"ack"];
+            "SUBSCRIBE" | "subscribe" => {
+                expect_keys = &["destination", "id", "ack"];
                 Subscribe {
                     destination: eh(h, "destination")?,
                     id: eh(h, "id")?,
@@ -303,59 +252,62 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
                     },
                 }
             }
-            b"UNSUBSCRIBE" | b"unsubscribe" => {
-                expect_keys = &[b"id"];
+            "UNSUBSCRIBE" | "unsubscribe" => {
+                expect_keys = &["id"];
                 Unsubscribe { id: eh(h, "id")? }
             }
-            b"ACK" | b"ack" => {
-                expect_keys = &[b"id", b"transaction"];
+            "ACK" | "ack" => {
+                expect_keys = &["id", "transaction"];
                 Ack {
                     id: eh(h, "id")?,
                     transaction: fh(h, "transaction"),
                 }
             }
-            b"NACK" | b"nack" => {
-                expect_keys = &[b"id", b"transaction"];
+            "NACK" | "nack" => {
+                expect_keys = &["id", "transaction"];
                 Nack {
                     id: eh(h, "id")?,
                     transaction: fh(h, "transaction"),
                 }
             }
-            b"BEGIN" | b"begin" => {
-                expect_keys = &[b"transaction"];
+            "BEGIN" | "begin" => {
+                expect_keys = &["transaction"];
                 Begin {
                     transaction: eh(h, "transaction")?,
                 }
             }
-            b"COMMIT" | b"commit" => {
-                expect_keys = &[b"transaction"];
+            "COMMIT" | "commit" => {
+                expect_keys = &["transaction"];
                 Commit {
                     transaction: eh(h, "transaction")?,
                 }
             }
-            b"ABORT" | b"abort" => {
-                expect_keys = &[b"transaction"];
+            "ABORT" | "abort" => {
+                expect_keys = &["transaction"];
                 Abort {
                     transaction: eh(h, "transaction")?,
                 }
             }
-            other => bail!("Frame not recognized: {:?}", String::from_utf8_lossy(other)),
+            other => bail!("Frame not recognized: {:?}", other),
         };
-        let extra_headers = h
-            .iter()
-            .filter_map(|(k, v)| {
-                if !expect_keys.contains(&k.as_bytes()) {
-                    Some((k.clone(), v.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let extra_headers: Vec<(String, String)> = extra_headers(h, expect_keys);
         Ok(Message {
             content,
             extra_headers,
         })
     }
+}
+
+fn extra_headers(h: &Vec<(String, String)>, expect_keys: &[&str]) -> Vec<(String, String)> {
+    h.iter()
+        .filter_map(|(k, v)| {
+            if expect_keys.contains(&k.as_str()) {
+                None
+            } else {
+                Some((k.clone(), v.clone()))
+            }
+        })
+        .collect()
 }
 
 impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
@@ -366,10 +318,10 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
         use self::fetch_header as fh;
         use FromServer::{Connected, Error, Message as Msg, Receipt};
         let h = &frame.headers;
-        let expect_keys: &[&[u8]];
-        let content = match frame.command {
-            b"CONNECTED" | b"connected" => {
-                expect_keys = &[b"version", b"session", b"server", b"heart-beat"];
+        let expect_keys: &[&str];
+        let content = match frame.command.as_ref() {
+            "CONNECTED" | "connected" => {
+                expect_keys = &["version", "session", "server", "heart-beat"];
                 Connected {
                     version: eh(h, "version")?,
                     session: fh(h, "session"),
@@ -380,13 +332,13 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
                     },
                 }
             }
-            b"MESSAGE" | b"message" => {
+            "MESSAGE" | "message" => {
                 expect_keys = &[
-                    b"destination",
-                    b"message-id",
-                    b"subscription",
-                    b"content-length",
-                    b"content-type",
+                    "destination",
+                    "message-id",
+                    "subscription",
+                    "content-length",
+                    "content-type",
                 ];
                 Msg {
                     destination: eh(h, "destination")?,
@@ -396,45 +348,28 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
                     body: frame.body.map(|v| v.to_vec()),
                 }
             }
-            b"RECEIPT" | b"receipt" => {
-                expect_keys = &[b"receipt-id"];
+            "RECEIPT" | "receipt" => {
+                expect_keys = &["receipt-id"];
                 Receipt {
                     receipt_id: eh(h, "receipt-id")?,
                 }
             }
-            b"ERROR" | b"error" => {
-                expect_keys = &[b"message", b"content-length", b"content-type"];
+            "ERROR" | "error" => {
+                expect_keys = &["message", "content-length", "content-type"];
                 Error {
                     message: fh(h, "message"),
                     content_type: fh(h, "content-type"),
                     body: frame.body.map(|v| v.to_vec()),
                 }
             }
-            other => bail!("Frame not recognized: {:?}", String::from_utf8_lossy(other)),
+            other => bail!("Frame not recognized: {:?}", other),
         };
-        let extra_headers = h
-            .iter()
-            .filter_map(|(k, v)| {
-                if !expect_keys.contains(&k.as_bytes()) {
-                    Some((k.clone(), v.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let extra_headers: Vec<(String, String)> = extra_headers(h, expect_keys);
         Ok(Message {
             content,
             extra_headers,
         })
     }
-}
-
-fn opt_str_to_bytes(s: &Option<String>) -> Option<Cow<[u8]>> {
-    s.as_ref().map(|v| Cow::Borrowed(v.as_bytes()))
-}
-
-fn str_to_bytes(s: &String) -> Option<Cow<[u8]>> {
-    Some(Cow::Borrowed(s.as_bytes()))
 }
 
 fn get_content_length_header(body: &[u8]) -> Vec<u8> {
@@ -449,26 +384,31 @@ fn parse_heartbeat(hb: &str) -> Result<(u32, u32)> {
 }
 
 impl<'a> From<&'a Message<FromServer>> for Frame<'a> {
-    fn from(value: &'a Message<FromServer>) -> Self {
-        match &value.content {
+    fn from(
+        Message {
+            content,
+            extra_headers,
+        }: &'a Message<FromServer>,
+    ) -> Self {
+        match &content {
             FromServer::Connected {
                 ref version,
                 ref session,
                 ref server,
                 ref heartbeat,
             } => Frame::new(
-                b"CONNECTED",
-                &[
-                    (b"version", str_to_bytes(version)),
+                "CONNECTED",
+                vec![
+                    ("version", version.into()),
                     (
-                        b"heart-beat",
-                        heartbeat.map(|(v1, v2)| Cow::Owned(format!("{},{}", v1, v2).into())),
+                        "heart-beat",
+                        heartbeat.map(|(v1, v2)| format!("{v1},{v2}")).as_ref(),
                     ),
-                    (b"session", opt_str_to_bytes(session)),
-                    (b"server", opt_str_to_bytes(server)),
+                    ("session", session.as_ref()),
+                    ("server", server.as_ref()),
                 ],
                 None,
-                &value.extra_headers,
+                extra_headers,
             ),
             FromServer::Message {
                 ref destination,
@@ -477,44 +417,48 @@ impl<'a> From<&'a Message<FromServer>> for Frame<'a> {
                 ref body,
                 ref content_type,
             } => Frame::new(
-                b"MESSAGE",
-                &[
-                    (b"subscription", str_to_bytes(subscription)),
-                    (b"message-id", str_to_bytes(message_id)),
-                    (b"destination", str_to_bytes(destination)),
-                    (b"content-type", opt_str_to_bytes(content_type)),
+                "MESSAGE",
+                vec![
+                    ("subscription", subscription.into()),
+                    ("message-id", message_id.into()),
+                    ("destination", destination.into()),
+                    ("content-type", content_type.as_ref()),
                 ],
                 body.as_ref().map(|v| v.as_ref()),
-                &value.extra_headers,
+                extra_headers,
             ),
             FromServer::Receipt { receipt_id } => Frame::new(
-                b"RECEIPT",
-                &[(b"receipt-id", str_to_bytes(receipt_id))],
+                "RECEIPT",
+                vec![("receipt-id", receipt_id.into())],
                 None,
-                &value.extra_headers,
+                extra_headers,
             ),
             FromServer::Error {
                 ref message,
                 ref body,
                 ref content_type,
             } => Frame::new(
-                b"ERROR",
-                &[
-                    (b"message", opt_str_to_bytes(message)),
-                    (b"content-type", opt_str_to_bytes(content_type)),
+                "ERROR",
+                vec![
+                    ("message", message.as_ref()),
+                    ("content-type", content_type.as_ref()),
                 ],
                 body.as_ref().map(|v| v.as_ref()),
-                &value.extra_headers,
+                extra_headers,
             ),
         }
     }
 }
 
 impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
-    fn from(msg: &'a Message<ToServer>) -> Frame<'a> {
-        use Cow::*;
+    fn from(
+        Message {
+            content,
+            extra_headers,
+        }: &'a Message<ToServer>,
+    ) -> Frame<'a> {
         use ToServer::*;
-        match &msg.content {
+        match &content {
             Connect {
                 ref accept_version,
                 ref host,
@@ -522,109 +466,104 @@ impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
                 ref passcode,
                 ref heartbeat,
             } => Frame::new(
-                b"CONNECT",
-                &[
-                    (b"accept-version", str_to_bytes(accept_version)),
-                    (b"host", str_to_bytes(host)),
-                    (b"login", opt_str_to_bytes(login)),
+                "CONNECT",
+                vec![
+                    ("accept-version", accept_version.into()),
+                    ("host", host.into()),
+                    ("login", login.as_ref()),
                     (
-                        b"heart-beat",
-                        heartbeat.map(|(v1, v2)| Owned(format!("{},{}", v1, v2).into())),
+                        "heart-beat",
+                        heartbeat.map(|(v1, v2)| format!("{v1},{v2}")).as_ref(),
                     ),
-                    (b"passcode", opt_str_to_bytes(passcode)),
+                    ("passcode", passcode.as_ref()),
                 ],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Disconnect { ref receipt } => Frame::new(
-                b"DISCONNECT",
-                &[(b"receipt", opt_str_to_bytes(&receipt))],
+                "DISCONNECT",
+                vec![("receipt", receipt.as_ref())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Subscribe {
                 ref destination,
                 ref id,
                 ref ack,
             } => Frame::new(
-                b"SUBSCRIBE",
-                &[
-                    (b"destination", str_to_bytes(destination)),
-                    (b"id", str_to_bytes(id)),
+                "SUBSCRIBE",
+                vec![
+                    ("destination", destination.into()),
+                    ("id", id.into()),
                     (
-                        b"ack",
-                        ack.map(|ack| match ack {
-                            AckMode::Auto => Borrowed(&b"auto"[..]),
-                            AckMode::Client => Borrowed(&b"client"[..]),
-                            AckMode::ClientIndividual => Borrowed(&b"client-individual"[..]),
-                        }),
+                        "ack",
+                        ack.map(|ack| {
+                            match ack {
+                                AckMode::Auto => "auto",
+                                AckMode::Client => "client",
+                                AckMode::ClientIndividual => "client-individual",
+                            }
+                            .to_string()
+                        })
+                        .as_ref(),
                     ),
                 ],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
-            Unsubscribe { ref id } => Frame::new(
-                b"UNSUBSCRIBE",
-                &[(b"id", str_to_bytes(id))],
-                None,
-                &msg.extra_headers,
-            ),
+            Unsubscribe { ref id } => {
+                Frame::new("UNSUBSCRIBE", vec![("id", id.into())], None, extra_headers)
+            }
             Send {
                 ref destination,
                 ref transaction,
                 ref body,
                 ref content_type,
             } => Frame::new(
-                b"SEND",
-                &[
-                    (b"destination", str_to_bytes(destination)),
-                    (b"transaction", opt_str_to_bytes(transaction)),
-                    (b"content-type", opt_str_to_bytes(content_type)),
+                "SEND",
+                vec![
+                    ("destination", destination.into()),
+                    ("transaction", transaction.as_ref()),
+                    ("content-type", content_type.as_ref()),
                 ],
                 body.as_ref().map(|v| v.as_ref()),
-                &msg.extra_headers,
+                extra_headers,
             ),
             Ack {
                 ref id,
                 ref transaction,
             } => Frame::new(
-                b"ACK",
-                &[
-                    (b"id", str_to_bytes(id)),
-                    (b"transaction", opt_str_to_bytes(transaction)),
-                ],
+                "ACK",
+                vec![("id", id.into()), ("transaction", transaction.as_ref())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Nack {
                 ref id,
                 ref transaction,
             } => Frame::new(
-                b"NACK",
-                &[
-                    (b"id", str_to_bytes(id)),
-                    (b"transaction", opt_str_to_bytes(transaction)),
-                ],
+                "NACK",
+                vec![("id", id.into()), ("transaction", transaction.as_ref())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Begin { ref transaction } => Frame::new(
-                b"BEGIN",
-                &[(b"transaction", str_to_bytes(transaction))],
+                "BEGIN",
+                vec![("transaction", transaction.into())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Commit { ref transaction } => Frame::new(
-                b"COMMIT",
-                &[(b"transaction", str_to_bytes(transaction))],
+                "COMMIT",
+                vec![("transaction", transaction.into())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
             Abort { ref transaction } => Frame::new(
-                b"ABORT",
-                &[(b"transaction", str_to_bytes(transaction))],
+                "ABORT",
+                vec![("transaction", transaction.into())],
                 None,
-                &msg.extra_headers,
+                extra_headers,
             ),
         }
     }
@@ -644,16 +583,16 @@ accept-version:1.2
 host:datafeeds.here.co.uk
 login:user
 heart-beat:6,7
-passcode:password\n\n\x00"
+passcode:password\\c123\n\n\x00"
             .to_vec();
         let (_, frame) = parse_frame(&data).unwrap();
-        assert_eq!(frame.command, b"CONNECT");
+        assert_eq!(frame.command.as_ref(), "CONNECT");
         let headers_expect: Vec<(&[u8], &[u8])> = vec![
             (&b"accept-version"[..], &b"1.2"[..]),
             (b"host", b"datafeeds.here.co.uk"),
             (b"login", b"user"),
             (b"heart-beat", b"6,7"),
-            (b"passcode", b"password"),
+            (b"passcode", b"password:123"),
         ];
         let fh: Vec<_> = frame
             .headers
@@ -666,6 +605,21 @@ passcode:password\n\n\x00"
         let mut buffer = BytesMut::new();
         Frame::from(&stomp).serialize(&mut buffer);
         assert_eq!(&*buffer, &*data);
+
+        let msg = Message::<ToServer>::try_from(&frame).unwrap();
+
+        assert_matches!( msg.content, ToServer::Connect {
+            heartbeat: Some((6,7)),
+            login: Some(ref login),
+            ..
+        } if login == "user" );
+
+        let mut bytes_mut = BytesMut::with_capacity(64);
+        Frame::from(&msg).serialize(&mut bytes_mut);
+
+        dbg!(&bytes_mut);
+
+        assert_eq!(bytes_mut.as_ref(), data)
     }
 
     #[test]
@@ -680,7 +634,7 @@ subscription:some-id
         let rest = format!("content-length:{}\n\n{}\x00", body.len(), body);
         data.extend_from_slice(rest.as_bytes());
         let (_, frame) = parse_frame(&data).unwrap();
-        assert_eq!(frame.command, b"MESSAGE");
+        assert_eq!(frame.command.as_bytes(), b"MESSAGE");
         let headers_expect: Vec<(&[u8], &[u8])> = vec![
             (&b"destination"[..], &b"datafeeds.here.co.uk"[..]),
             (b"message-id", b"12345"),
@@ -695,9 +649,6 @@ subscription:some-id
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
         Message::<FromServer>::try_from(&frame).unwrap();
-        // TODO to_frame for FromServer
-        // let roundtrip = stomp.to_frame().serialize();
-        // assert_eq!(roundtrip, data);
     }
 
     #[test]
@@ -711,7 +662,7 @@ subscription:some-id"
         let rest = format!("\n\n{}\x00\r\n", body);
         data.extend_from_slice(rest.as_bytes());
         let (_, frame) = parse_frame(&data).unwrap();
-        assert_eq!(frame.command, b"MESSAGE");
+        assert_eq!(frame.command.as_bytes(), b"MESSAGE");
         let headers_expect: Vec<(&[u8], &[u8])> = vec![
             (&b"destination"[..], &b"datafeeds.here.co.uk"[..]),
             (b"message-id", b"12345"),
@@ -724,10 +675,6 @@ subscription:some-id"
             .collect();
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, Some(body.as_bytes()));
-        Message::<FromServer>::try_from(&frame).unwrap();
-        // TODO to_frame for FromServer
-        // let roundtrip = stomp.to_frame().serialize();
-        // assert_eq!(roundtrip, data);
     }
 
     #[test]
@@ -738,7 +685,7 @@ message-id:12345
 subscription:some-id\n\nsomething-like-header:1\x00\r\n"
             .to_vec();
         let (_, frame) = parse_frame(&data).unwrap();
-        assert_eq!(frame.command, b"MESSAGE");
+        assert_eq!(frame.command.as_bytes(), b"MESSAGE");
         let headers_expect: Vec<(&[u8], &[u8])> = vec![
             (b"destination", b"datafeeds.here.co.uk"),
             (b"message-id", b"12345"),
@@ -753,10 +700,9 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         assert_eq!(frame.body, Some("something-like-header:1".as_bytes()));
         let msg = Message::<FromServer>::try_from(&frame).unwrap();
         let mut bytes_mut = BytesMut::with_capacity(64);
-        let roundtrip = Frame::from(&msg).serialize(&mut bytes_mut);
+        Frame::from(&msg).serialize(&mut bytes_mut);
 
         dbg!(&bytes_mut);
-        // assert_eq!(roundtrip, data);
     }
 
     #[test]
@@ -776,11 +722,11 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
             Ok((
                 _,
                 Frame {
-                    command: b"MESSAG",
+                    ref command,
                     headers: _,
                     body: None
                 }
-            ))
+            )) if command == "MESSAG"
         );
 
         assert_matches!(
@@ -843,8 +789,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
 
     #[test]
     fn parse_and_serialize_message_header_value_with_colon() {
-        let data = b"
-CONNECTED
+        let data = b"CONNECTED
 server:ActiveMQ/6.0.0
 heart-beat:0,0
 session:ID:orbstack-45879-1702220142549-3:2
@@ -853,7 +798,7 @@ version:1.2
 \0\n"
             .to_vec();
         let (_, frame) = parse_frame(&data).unwrap();
-        assert_eq!(frame.command, b"CONNECTED");
+        assert_eq!(frame.command.as_bytes(), b"CONNECTED");
         let headers_expect: Vec<(&[u8], &[u8])> = vec![
             (b"server", b"ActiveMQ/6.0.0"),
             (b"heart-beat", b"0,0"),
@@ -866,13 +811,13 @@ version:1.2
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
         assert_eq!(fh, headers_expect);
-        Message::<FromServer>::try_from(&frame).unwrap();
+        let msg = Message::<FromServer>::try_from(&frame).unwrap();
     }
 
     #[test]
     fn test_parser_header1() {
         let h = parse_frame(b"MESSAGE\nsubscription:11\nmessage-id:0.4.0\ndestination:now\\c Instant {\\n    tv_sec\\c 5740,\\n    tv_nsec\\c 164006416,\\n}\ncontent-type:application/json\nserver:tokio-stomp/0.4.0\n\n\0".as_ref());
         dbg!(&h);
-        // assert_matches!(h, Ok((b"", _)),);
+        // assert_matches!(h, Ok(("", _)),);
     }
 }

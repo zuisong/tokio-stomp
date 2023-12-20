@@ -72,11 +72,14 @@ async fn process_socket(tcp: TcpStream) -> Result<()> {
             })
             .await
             .unwrap();
+            log::info!("server send a message");
 
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     })
     .await?;
+
+    log::error!("tokio server exit!");
 
     Ok(())
 }

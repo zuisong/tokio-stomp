@@ -3,8 +3,8 @@ use log::info;
 use std::time::Duration;
 use tokio_stomp::{client, server};
 
-async fn client(listens: &str, sends: &str, msg: &[u8]) -> Result<(), anyhow::Error> {
-    let mut conn = client::connect(
+async fn client(listens: &str, _sends: &str, _msg: &[u8]) -> Result<(), anyhow::Error> {
+    let conn = client::connect(
         "127.0.0.1:8081",
         "/".to_string(),
         "guest".to_string().into(),
