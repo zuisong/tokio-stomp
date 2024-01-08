@@ -1,4 +1,3 @@
-use futures::SinkExt;
 use log::info;
 use std::time::Duration;
 use tokio_stomp::{client, server};

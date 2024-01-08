@@ -76,7 +76,7 @@ impl Decoder for ClientCodec {
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
         let (item, offset) = match frame::parse_frame(&src) {
             Ok((remain, frame)) => (
-                Message::<FromServer>::try_from(&frame),
+                Message::<FromServer>::try_from(frame),
                 remain.as_ptr() as usize - src.as_ptr() as usize,
             ),
             Err(nom::Err::Incomplete(_)) => return Ok(None),
@@ -95,7 +95,7 @@ impl Encoder<Message<ToServer>> for ClientCodec {
         item: Message<ToServer>,
         dst: &mut BytesMut,
     ) -> std::result::Result<(), Self::Error> {
-        let f: Frame = (&item).into();
+        let f: Frame = item.into();
 
         f.serialize(dst);
         Ok(())

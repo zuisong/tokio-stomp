@@ -20,54 +20,43 @@ use std::borrow::Cow;
 pub(crate) struct Frame<'a> {
     command: Cow<'a, str>,
     headers: Vec<(String, String)>,
-    body: Option<&'a [u8]>,
+    body: Option<Cow<'a, [u8]>>,
 }
 
 impl<'a> Frame<'a> {
     pub(crate) fn new(
         command: impl Into<Cow<'a, str>>,
-        headers: Vec<(&str, Option<&String>)>,
-        body: Option<&'a [u8]>,
-        extra_headers: &Vec<(String, String)>,
+        headers: Vec<(&str, impl Into<Option<String>>)>,
+        body: Option<Vec<u8>>,
+        extra_headers: Vec<(String, String)>,
     ) -> Frame<'a> {
-        let mut headers: Vec<(String, String)> = headers
-            .iter()
-            .filter_map(|(k, v)| v.map(|v| (k.to_string(), v.to_string())))
+        let mut headers: Vec<_> = headers
+            .into_iter()
+            .filter_map(|(k, vv)| vv.into().map(|v| (k.to_string(), v)))
             .collect();
 
-        headers.extend(extra_headers.clone());
+        headers.extend(extra_headers);
 
         Frame {
             command: command.into(),
             headers,
-            body,
+            body: body.map(Cow::Owned),
         }
     }
 
     pub(crate) fn serialize(&self, buffer: &mut BytesMut) {
         fn write_escaped(b: u8, buffer: &mut BytesMut) {
-            match b {
-                b'\r' => {
-                    buffer.put_u8(b'\\');
-                    buffer.put_u8(b'r')
-                }
-                b'\n' => {
-                    buffer.put_u8(b'\\');
-                    buffer.put_u8(b'n')
-                }
-                b':' => {
-                    buffer.put_u8(b'\\');
-                    buffer.put_u8(b'c')
-                }
-                b'\\' => {
-                    buffer.put_u8(b'\\');
-                    buffer.put_u8(b'\\')
-                }
-                b => buffer.put_u8(b),
-            }
+            let escaped: &[u8] = match b {
+                b'\r' => b"\\r",
+                b'\n' => b"\\n",
+                b':' => b"\\c",
+                b'\\' => b"\\\\",
+                b => return buffer.put_u8(b),
+            };
+            buffer.put_slice(escaped)
         }
         let requires = self.command.len()
-            + self.body.map(|b| b.len() + 20).unwrap_or(0)
+            + self.body.as_ref().map(|b| b.len() + 20).unwrap_or(0)
             + self
                 .headers
                 .iter()
@@ -88,7 +77,7 @@ impl<'a> Frame<'a> {
             }
             buffer.put_u8(b'\n');
         });
-        if let Some(body) = self.body {
+        if let Some(ref body) = self.body {
             buffer.put_slice(&get_content_length_header(&body));
             buffer.put_u8(b'\n');
             buffer.put_slice(body);
@@ -99,8 +88,6 @@ impl<'a> Frame<'a> {
     }
 }
 
-// Nom definitions
-
 fn get_content_length(headers: &Vec<(String, String)>) -> Option<usize> {
     for (name, value) in headers {
         if name.as_str() == "content-length" {
@@ -110,12 +97,8 @@ fn get_content_length(headers: &Vec<(String, String)>) -> Option<usize> {
     None
 }
 
-fn is_empty_slice(s: &[u8]) -> Option<&[u8]> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+fn map_empty_slice(s: &[u8]) -> Option<&[u8]> {
+    Some(s).filter(|c| !c.is_empty())
 }
 
 pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
@@ -137,7 +120,7 @@ pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
     ))(input)?;
 
     let (input, body) = match get_content_length(&headers) {
-        None => take_until("\x00").map(is_empty_slice).parse(input)?,
+        None => take_until("\x00").map(map_empty_slice).parse(input)?,
         Some(length) => take(length).map(Some).parse(input)?,
     };
 
@@ -148,7 +131,7 @@ pub(crate) fn parse_frame(input: &[u8]) -> IResult<&[u8], Frame> {
         Frame {
             command,
             headers,
-            body,
+            body: body.map(Cow::Borrowed),
         },
     ))
 }
@@ -193,35 +176,40 @@ fn expect_header(headers: &Vec<(String, String)>, key: &str) -> Result<String> {
     fetch_header(headers, key).ok_or_else(|| anyhow!("Expected header '{}' missing", key))
 }
 
-impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
+impl<'a> TryFrom<Frame<'a>> for Message<ToServer> {
     type Error = anyhow::Error;
 
-    fn try_from(frame: &'a Frame<'a>) -> std::result::Result<Self, Self::Error> {
+    fn try_from(
+        Frame {
+            command,
+            ref headers,
+            body,
+        }: Frame<'a>,
+    ) -> std::result::Result<Self, Self::Error> {
         use self::expect_header as eh;
         use self::fetch_header as fh;
         use ToServer::*;
-        let h = &frame.headers;
         let expect_keys: &[&str];
-        let content = match frame.command.as_ref() {
+        let content = match command.to_uppercase().as_ref() {
             "STOMP" | "CONNECT" | "stomp" | "connect" => {
                 expect_keys = &["accept-version", "host", "login", "passcode", "heart-beat"];
-                let heartbeat = if let Some(hb) = fh(h, "heart-beat") {
+                let heartbeat = if let Some(hb) = fh(headers, "heart-beat") {
                     Some(parse_heartbeat(&hb)?)
                 } else {
                     None
                 };
                 Connect {
-                    accept_version: eh(h, "accept-version")?,
-                    host: eh(h, "host")?,
-                    login: fh(h, "login"),
-                    passcode: fh(h, "passcode"),
+                    accept_version: eh(headers, "accept-version")?,
+                    host: eh(headers, "host")?,
+                    login: fh(headers, "login"),
+                    passcode: fh(headers, "passcode"),
                     heartbeat,
                 }
             }
             "DISCONNECT" | "disconnect" => {
                 expect_keys = &["receipt"];
                 Disconnect {
-                    receipt: fh(h, "receipt"),
+                    receipt: fh(headers, "receipt"),
                 }
             }
             "SEND" | "send" => {
@@ -232,18 +220,18 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
                     "content-type",
                 ];
                 Send {
-                    destination: eh(h, "destination")?,
-                    transaction: fh(h, "transaction"),
-                    content_type: fh(h, "content-type"),
-                    body: frame.body.map(|v| v.to_vec()),
+                    destination: eh(headers, "destination")?,
+                    transaction: fh(headers, "transaction"),
+                    content_type: fh(headers, "content-type"),
+                    body: body.map(|v| v.to_vec()),
                 }
             }
             "SUBSCRIBE" | "subscribe" => {
                 expect_keys = &["destination", "id", "ack"];
                 Subscribe {
-                    destination: eh(h, "destination")?,
-                    id: eh(h, "id")?,
-                    ack: match fh(h, "ack").as_ref().map(|s| s.as_str()) {
+                    destination: eh(headers, "destination")?,
+                    id: eh(headers, "id")?,
+                    ack: match fh(headers, "ack").as_ref().map(|s| s.as_str()) {
                         Some("auto") => Some(AckMode::Auto),
                         Some("client") => Some(AckMode::Client),
                         Some("client-individual") => Some(AckMode::ClientIndividual),
@@ -254,43 +242,45 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<ToServer> {
             }
             "UNSUBSCRIBE" | "unsubscribe" => {
                 expect_keys = &["id"];
-                Unsubscribe { id: eh(h, "id")? }
+                Unsubscribe {
+                    id: eh(headers, "id")?,
+                }
             }
             "ACK" | "ack" => {
                 expect_keys = &["id", "transaction"];
                 Ack {
-                    id: eh(h, "id")?,
-                    transaction: fh(h, "transaction"),
+                    id: eh(headers, "id")?,
+                    transaction: fh(headers, "transaction"),
                 }
             }
             "NACK" | "nack" => {
                 expect_keys = &["id", "transaction"];
                 Nack {
-                    id: eh(h, "id")?,
-                    transaction: fh(h, "transaction"),
+                    id: eh(headers, "id")?,
+                    transaction: fh(headers, "transaction"),
                 }
             }
             "BEGIN" | "begin" => {
                 expect_keys = &["transaction"];
                 Begin {
-                    transaction: eh(h, "transaction")?,
+                    transaction: eh(headers, "transaction")?,
                 }
             }
             "COMMIT" | "commit" => {
                 expect_keys = &["transaction"];
                 Commit {
-                    transaction: eh(h, "transaction")?,
+                    transaction: eh(headers, "transaction")?,
                 }
             }
             "ABORT" | "abort" => {
                 expect_keys = &["transaction"];
                 Abort {
-                    transaction: eh(h, "transaction")?,
+                    transaction: eh(headers, "transaction")?,
                 }
             }
             other => bail!("Frame not recognized: {:?}", other),
         };
-        let extra_headers: Vec<(String, String)> = extra_headers(h, expect_keys);
+        let extra_headers: Vec<(String, String)> = extra_headers(headers, expect_keys);
         Ok(Message {
             content,
             extra_headers,
@@ -310,23 +300,29 @@ fn extra_headers(h: &Vec<(String, String)>, expect_keys: &[&str]) -> Vec<(String
         .collect()
 }
 
-impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
+impl<'a> TryFrom<Frame<'a>> for Message<FromServer> {
     type Error = anyhow::Error;
 
-    fn try_from(frame: &'a Frame<'a>) -> std::result::Result<Self, Self::Error> {
+    fn try_from(
+        Frame {
+            command,
+            ref headers,
+            body,
+        }: Frame<'a>,
+    ) -> std::result::Result<Self, Self::Error> {
         use self::expect_header as eh;
         use self::fetch_header as fh;
         use FromServer::{Connected, Error, Message as Msg, Receipt};
-        let h = &frame.headers;
         let expect_keys: &[&str];
-        let content = match frame.command.as_ref() {
+
+        let content = match command.to_uppercase().as_ref() {
             "CONNECTED" | "connected" => {
                 expect_keys = &["version", "session", "server", "heart-beat"];
                 Connected {
-                    version: eh(h, "version")?,
-                    session: fh(h, "session"),
-                    server: fh(h, "server"),
-                    heartbeat: match fh(h, "heart-beat") {
+                    version: eh(headers, "version")?,
+                    session: fh(headers, "session"),
+                    server: fh(headers, "server"),
+                    heartbeat: match fh(headers, "heart-beat") {
                         Some(hb) => Some(parse_heartbeat(&hb)?),
                         None => None,
                     },
@@ -341,30 +337,30 @@ impl<'a> TryFrom<&'a Frame<'a>> for Message<FromServer> {
                     "content-type",
                 ];
                 Msg {
-                    destination: eh(h, "destination")?,
-                    message_id: eh(h, "message-id")?,
-                    subscription: eh(h, "subscription")?,
-                    content_type: fh(h, "content-type"),
-                    body: frame.body.map(|v| v.to_vec()),
+                    destination: eh(headers, "destination")?,
+                    message_id: eh(headers, "message-id")?,
+                    subscription: eh(headers, "subscription")?,
+                    content_type: fh(headers, "content-type"),
+                    body: body.map(|v| v.to_vec()),
                 }
             }
             "RECEIPT" | "receipt" => {
                 expect_keys = &["receipt-id"];
                 Receipt {
-                    receipt_id: eh(h, "receipt-id")?,
+                    receipt_id: eh(headers, "receipt-id")?,
                 }
             }
             "ERROR" | "error" => {
                 expect_keys = &["message", "content-length", "content-type"];
                 Error {
-                    message: fh(h, "message"),
-                    content_type: fh(h, "content-type"),
-                    body: frame.body.map(|v| v.to_vec()),
+                    message: fh(headers, "message"),
+                    content_type: fh(headers, "content-type"),
+                    body: body.map(|v| v.to_vec()),
                 }
             }
             other => bail!("Frame not recognized: {:?}", other),
         };
-        let extra_headers: Vec<(String, String)> = extra_headers(h, expect_keys);
+        let extra_headers: Vec<(String, String)> = extra_headers(headers, expect_keys);
         Ok(Message {
             content,
             extra_headers,
@@ -383,113 +379,104 @@ fn parse_heartbeat(hb: &str) -> Result<(u32, u32)> {
     Ok((left.parse()?, right.parse()?))
 }
 
-impl<'a> From<&'a Message<FromServer>> for Frame<'a> {
+impl<'a> From<Message<FromServer>> for Frame<'a> {
     fn from(
         Message {
             content,
             extra_headers,
-        }: &'a Message<FromServer>,
+        }: Message<FromServer>,
     ) -> Self {
-        match &content {
+        match content {
             FromServer::Connected {
-                ref version,
-                ref session,
-                ref server,
-                ref heartbeat,
+                version,
+                session,
+                server,
+                heartbeat,
             } => Frame::new(
                 "CONNECTED",
                 vec![
                     ("version", version.into()),
-                    (
-                        "heart-beat",
-                        heartbeat.map(|(v1, v2)| format!("{v1},{v2}")).as_ref(),
-                    ),
-                    ("session", session.as_ref()),
-                    ("server", server.as_ref()),
+                    ("heart-beat", heartbeat.map(|(v1, v2)| format!("{v1},{v2}"))),
+                    ("session", session),
+                    ("server", server),
                 ],
                 None,
                 extra_headers,
             ),
             FromServer::Message {
-                ref destination,
-                ref message_id,
-                ref subscription,
-                ref body,
-                ref content_type,
+                destination,
+                message_id,
+                subscription,
+                body,
+                content_type,
             } => Frame::new(
                 "MESSAGE",
                 vec![
                     ("subscription", subscription.into()),
                     ("message-id", message_id.into()),
                     ("destination", destination.into()),
-                    ("content-type", content_type.as_ref()),
+                    ("content-type", content_type),
                 ],
-                body.as_ref().map(|v| v.as_ref()),
+                body,
                 extra_headers,
             ),
             FromServer::Receipt { receipt_id } => Frame::new(
                 "RECEIPT",
-                vec![("receipt-id", receipt_id.into())],
+                vec![("receipt-id", receipt_id)],
                 None,
                 extra_headers,
             ),
             FromServer::Error {
-                ref message,
-                ref body,
-                ref content_type,
+                message,
+                body,
+                content_type,
             } => Frame::new(
                 "ERROR",
-                vec![
-                    ("message", message.as_ref()),
-                    ("content-type", content_type.as_ref()),
-                ],
-                body.as_ref().map(|v| v.as_ref()),
+                vec![("message", message), ("content-type", content_type)],
+                body,
                 extra_headers,
             ),
         }
     }
 }
 
-impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
+impl<'a> From<Message<ToServer>> for Frame<'a> {
     fn from(
         Message {
             content,
             extra_headers,
-        }: &'a Message<ToServer>,
+        }: Message<ToServer>,
     ) -> Frame<'a> {
         use ToServer::*;
-        match &content {
+        match content {
             Connect {
-                ref accept_version,
-                ref host,
-                ref login,
-                ref passcode,
-                ref heartbeat,
+                accept_version,
+                host,
+                login,
+                passcode,
+                heartbeat,
             } => Frame::new(
                 "CONNECT",
                 vec![
                     ("accept-version", accept_version.into()),
                     ("host", host.into()),
-                    ("login", login.as_ref()),
-                    (
-                        "heart-beat",
-                        heartbeat.map(|(v1, v2)| format!("{v1},{v2}")).as_ref(),
-                    ),
-                    ("passcode", passcode.as_ref()),
+                    ("login", login),
+                    ("heart-beat", heartbeat.map(|(v1, v2)| format!("{v1},{v2}"))),
+                    ("passcode", passcode),
                 ],
                 None,
                 extra_headers,
             ),
-            Disconnect { ref receipt } => Frame::new(
+            Disconnect { receipt } => Frame::new(
                 "DISCONNECT",
-                vec![("receipt", receipt.as_ref())],
+                vec![("receipt", receipt)],
                 None,
                 extra_headers,
             ),
             Subscribe {
-                ref destination,
-                ref id,
-                ref ack,
+                destination,
+                id,
+                ack,
             } => Frame::new(
                 "SUBSCRIBE",
                 vec![
@@ -504,64 +491,55 @@ impl<'a> From<&'a Message<ToServer>> for Frame<'a> {
                                 AckMode::ClientIndividual => "client-individual",
                             }
                             .to_string()
-                        })
-                        .as_ref(),
+                        }),
                     ),
                 ],
                 None,
                 extra_headers,
             ),
-            Unsubscribe { ref id } => {
-                Frame::new("UNSUBSCRIBE", vec![("id", id.into())], None, extra_headers)
-            }
+            Unsubscribe { id } => Frame::new("UNSUBSCRIBE", vec![("id", id)], None, extra_headers),
             Send {
-                ref destination,
-                ref transaction,
-                ref body,
-                ref content_type,
+                destination,
+                transaction,
+                body,
+                content_type,
             } => Frame::new(
                 "SEND",
                 vec![
                     ("destination", destination.into()),
-                    ("transaction", transaction.as_ref()),
-                    ("content-type", content_type.as_ref()),
+                    ("transaction", transaction),
+                    ("content-type", content_type),
                 ],
-                body.as_ref().map(|v| v.as_ref()),
+                body,
                 extra_headers,
             ),
-            Ack {
-                ref id,
-                ref transaction,
-            } => Frame::new(
+            Ack { id, transaction } => Frame::new(
                 "ACK",
-                vec![("id", id.into()), ("transaction", transaction.as_ref())],
+                vec![("id", id.into()), ("transaction", transaction)],
                 None,
                 extra_headers,
             ),
-            Nack {
-                ref id,
-                ref transaction,
-            } => Frame::new(
+            Nack { id, transaction } => Frame::new(
                 "NACK",
-                vec![("id", id.into()), ("transaction", transaction.as_ref())],
+                vec![("id", id.into()), ("transaction", transaction)],
                 None,
                 extra_headers,
             ),
-            Begin { ref transaction } => Frame::new(
+            Begin { transaction } => Frame::new(
                 "BEGIN",
-                vec![("transaction", transaction.into())],
+                vec![("transaction", transaction)],
                 None,
                 extra_headers,
             ),
-            Commit { ref transaction } => Frame::new(
+            Commit { transaction } => Frame::new(
                 "COMMIT",
-                vec![("transaction", transaction.into())],
+                vec![("transaction", transaction)],
                 None,
                 extra_headers,
             ),
-            Abort { ref transaction } => Frame::new(
+            Abort { transaction } => Frame::new(
                 "ABORT",
-                vec![("transaction", transaction.into())],
+                vec![("transaction", transaction)],
                 None,
                 extra_headers,
             ),
@@ -599,27 +577,24 @@ passcode:password\\c123\n\n\x00"
             .iter()
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
+
         assert_eq!(fh, headers_expect);
         assert_eq!(frame.body, None);
-        let stomp = Message::<ToServer>::try_from(&frame).unwrap();
-        let mut buffer = BytesMut::new();
-        Frame::from(&stomp).serialize(&mut buffer);
-        assert_eq!(&*buffer, &*data);
+        let stomp = Message::<ToServer>::try_from(frame).unwrap();
 
-        let msg = Message::<ToServer>::try_from(&frame).unwrap();
-
-        assert_matches!( msg.content, ToServer::Connect {
+        assert_matches!( stomp.content, ToServer::Connect {
             heartbeat: Some((6,7)),
             login: Some(ref login),
             ..
         } if login == "user" );
 
-        let mut bytes_mut = BytesMut::with_capacity(64);
-        Frame::from(&msg).serialize(&mut bytes_mut);
+        let mut buffer = BytesMut::new();
+        Frame::from(stomp).serialize(&mut buffer);
+        assert_eq!(&*buffer, &*data);
 
-        dbg!(&bytes_mut);
+        dbg!(&buffer);
 
-        assert_eq!(bytes_mut.as_ref(), data)
+        assert_eq!(buffer.as_ref(), data)
     }
 
     #[test]
@@ -647,8 +622,8 @@ subscription:some-id
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
         assert_eq!(fh, headers_expect);
-        assert_eq!(frame.body, Some(body.as_bytes()));
-        Message::<FromServer>::try_from(&frame).unwrap();
+        assert_eq!((&frame).body.as_ref().unwrap().as_ref(), (body.as_bytes()));
+        Message::<FromServer>::try_from(frame).unwrap();
     }
 
     #[test]
@@ -674,7 +649,7 @@ subscription:some-id"
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
         assert_eq!(fh, headers_expect);
-        assert_eq!(frame.body, Some(body.as_bytes()));
+        assert_eq!(frame.body.unwrap(), (body.as_bytes()));
     }
 
     #[test]
@@ -697,10 +672,13 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
         assert_eq!(fh, headers_expect);
-        assert_eq!(frame.body, Some("something-like-header:1".as_bytes()));
-        let msg = Message::<FromServer>::try_from(&frame).unwrap();
+        assert_eq!(
+            frame.body.as_ref().unwrap().as_ref(),
+            ("something-like-header:1".as_bytes())
+        );
+        let msg = Message::<FromServer>::try_from(frame).unwrap();
         let mut bytes_mut = BytesMut::with_capacity(64);
-        Frame::from(&msg).serialize(&mut bytes_mut);
+        Frame::from(msg).serialize(&mut bytes_mut);
 
         dbg!(&bytes_mut);
     }
@@ -746,7 +724,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
 
         assert_matches!(
             Message::<ToServer>::try_from(
-                &parse_frame(b"\nSEND\r\ndestination:da\\ntafeedsuk\n\n\0".as_ref())
+                parse_frame(b"\nSEND\r\ndestination:da\\ntafeedsuk\n\n\0".as_ref())
                     .unwrap()
                     .1
             ),
@@ -777,7 +755,7 @@ subscription:some-id\n\nsomething-like-header:1\x00\r\n"
         );
         assert_matches!(
             parse_frame(b"\nMESSAGE\ncontent-length:0\n\n\0remain".as_ref()),
-            Ok((b"remain", Frame { body: Some([]), .. })),
+            Ok((b"remain", Frame {   body:  Some(ref b), .. })) if b.len()==0,
             "empty body with content-length:0, body should be Some([])"
         );
         assert_matches!(
@@ -811,13 +789,13 @@ version:1.2
             .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
             .collect();
         assert_eq!(fh, headers_expect);
-        let msg = Message::<FromServer>::try_from(&frame).unwrap();
+        let _msg = Message::<FromServer>::try_from(frame).unwrap();
     }
 
     #[test]
     fn test_parser_header1() {
-        let h = parse_frame(b"MESSAGE\nsubscription:11\nmessage-id:0.4.0\ndestination:now\\c Instant {\\n    tv_sec\\c 5740,\\n    tv_nsec\\c 164006416,\\n}\ncontent-type:application/json\nserver:tokio-stomp/0.4.0\n\n\0".as_ref());
+        let h = parse_frame(b"MESSAGE\nsubscription:11\nmessage-id:0.4.0\ndestination:now\\c Instant {\\n    tv_sec\\c 5740,\\n    tv_nsec\\c 164006416,\\n}\ncontent-type:application/json\nserver:tokio-stomp/0.4.0\n\nbody\0".as_ref());
         dbg!(&h);
-        // assert_matches!(h, Ok(("", _)),);
+        assert_matches!(h, Ok((b"", Frame{ body:Some(ref b) ,..})) if b.as_ref() == b"body");
     }
 }
